@@ -1,124 +1,82 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 from datetime import datetime
 import plotly.graph_objects as go
-import io
 
-# ---- Load NASDAQ Tickers and Metadata ----
-@st.cache_data
-def load_nasdaq_metadata():
+st.set_page_config(page_title="NASDAQ Screener", layout="wide")
+st.title("📉 NASDAQ Stock Screener - Continuous Fall & Fundamentals")
+
+# User inputs
+x_days = st.slider("📉 Number of continuous red days", min_value=2, max_value=10, value=3)
+min_drop = st.slider("📉 Minimum total % drop over x days", min_value=1, max_value=50, value=5)
+
+st.markdown(f"🔍 Screening NASDAQ stocks that have fallen {x_days} days in a row and dropped ≥ {min_drop}%.")
+
+@st.cache_data(show_spinner=False)
+def get_nasdaq_tickers():
     url = "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
     df = pd.read_csv(url)
-    return df[['Symbol', 'Security Name']]
+    return df["Symbol"].dropna().unique().tolist()
 
-@st.cache_data
-def get_sector_and_market_cap(ticker):
+@st.cache_data(show_spinner=False)
+def get_fundamentals(ticker):
     try:
         info = yf.Ticker(ticker).info
-        sector = info.get("sector", "N/A")
-        market_cap = info.get("marketCap", 0)
-        return sector, market_cap
+        rev_g = info.get("revenueGrowth", 0) * 100
+        earn_g = info.get("earningsGrowth", 0) * 100
+        debt_eq = info.get("debtToEquity", 999)
+        return rev_g, earn_g, debt_eq
     except:
-        return "N/A", 0
+        return 0, 0, 999
 
-# ---- Stock Screener Logic ----
-def has_fallen_consecutively(ticker, days, min_drop_pct):
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period=f"{days + 5}d")
-    hist = hist.tail(days)
+def check_red_days(ticker, x, min_pct_drop):
+    try:
+        df = yf.download(ticker, period=f"{x+5}d", interval="1d", progress=False)
+        df = df.tail(x)
+        if len(df) < x:
+            return False, None, None
+        closes = df['Close']
+        if all(closes.iloc[i] < closes.iloc[i-1] for i in range(1, len(closes))):
+            drop = (closes.iloc[0] - closes.iloc[-1]) / closes.iloc[0] * 100
+            if drop >= min_pct_drop:
+                return True, round(drop, 2), df
+    except:
+        return False, None, None
+    return False, None, None
 
-    if len(hist) < days:
-        return False, 0, hist
+# Main processing
+nasdaq_tickers = get_nasdaq_tickers()
+results = []
+charts = {}
 
-    closes = hist["Close"]
-    daily_fall = closes.diff().dropna() < 0
+with st.spinner("🔎 Scanning tickers..."):
+    for ticker in nasdaq_tickers:
+        valid, drop_pct, df = check_red_days(ticker, x_days, min_drop)
+        if valid:
+            rev_g, earn_g, debt_eq = get_fundamentals(ticker)
+            if rev_g > 5 and earn_g > 7 and debt_eq < 20:
+                results.append({
+                    "Ticker": ticker,
+                    "Drop %": drop_pct,
+                    "Revenue Growth %": round(rev_g, 2),
+                    "Earnings Growth %": round(earn_g, 2),
+                    "Debt/Equity": round(debt_eq, 2)
+                })
+                charts[ticker] = df
 
-    if daily_fall.sum() == days:
-        total_drop_pct = ((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0]) * 100
-        if total_drop_pct < -min_drop_pct:
-            return True, total_drop_pct, closes
-    return False, 0, closes
+# Display results
+if results:
+    df_results = pd.DataFrame(results)
+    st.success(f"✅ {len(results)} stocks found.")
+    st.dataframe(df_results, use_container_width=True)
 
-def get_fundamentals(ticker):
-    stock = yf.Ticker(ticker)
-    info = stock.info
-
-    rev_g = info.get("revenueGrowth", 0) * 100
-    earn_g = info.get("earningsGrowth", 0) * 100
-    debt_eq = info.get("debtToEquity", 999)
-    return rev_g, earn_g, debt_eq
-
-def screen_stocks(df_meta, x_days, pct_drop, sector_filter, market_cap_filter):
-    matched = []
-    history_data = {}
-
-    for _, row in df_meta.iterrows():
-        ticker = row["Symbol"]
-        try:
-            sector, mcap = get_sector_and_market_cap(ticker)
-            if (sector_filter != "All" and sector != sector_filter) or (mcap < market_cap_filter):
-                continue
-
-            is_down, drop_pct, closes = has_fallen_consecutively(ticker, x_days, pct_drop)
-            if is_down:
-                rev, earn, debt = get_fundamentals(ticker)
-                if rev > 5 and earn > 7 and debt < 80:
-                    matched.append({
-                        "Ticker": ticker,
-                        "Name": row["Security Name"],
-                        "Sector": sector,
-                        "Market Cap ($B)": round(mcap / 1e9, 2),
-                        "Drop (%)": round(drop_pct, 2),
-                        "Revenue Growth (%)": round(rev, 2),
-                        "Earnings Growth (%)": round(earn, 2),
-                        "Debt/Equity (%)": round(debt, 2)
-                    })
-                    history_data[ticker] = closes
-        except Exception as e:
-            continue
-
-    return pd.DataFrame(matched), history_data
-
-# ---- Streamlit UI ----
-st.set_page_config(layout="wide")
-st.title("📉 NASDAQ Stock Screener (Falling X Days + Fundamentals)")
-
-nasdaq_df = load_nasdaq_metadata()
-tickers = nasdaq_df["Symbol"].tolist()
-
-x_days = st.slider("Consecutive Red Days", 2, 10, 5)
-pct_drop = st.slider("Minimum % Drop over Period", 1, 20, 5)
-
-# Sector and Market Cap Filters
-sectors = ["All"] + sorted({get_sector_and_market_cap(t)[0] for t in tickers[:100]})
-sector_filter = st.selectbox("Filter by Sector", sectors)
-market_cap_filter = st.slider("Min Market Cap (Billion USD)", 0, 500, 10)
-
-if st.button("🔍 Run Screener"):
-    with st.spinner("Running screener..."):
-        result_df, chart_data = screen_stocks(nasdaq_df, x_days, pct_drop, sector_filter, market_cap_filter * 1e9)
-
-    if result_df.empty:
-        st.warning("No matching stocks found.")
-    else:
-        st.success(f"✅ {len(result_df)} matching stocks found.")
-        st.dataframe(result_df, use_container_width=True)
-
-        # Export
-        csv = result_df.to_csv(index=False).encode()
-        st.download_button("📥 Download CSV", data=csv, file_name="stock_screener_results.csv", mime='text/csv')
-
-        # Charts
-        st.subheader("📈 Price Charts")
-        for ticker in result_df["Ticker"]:
-            st.markdown(f"**{ticker} - Last {x_days} Days**")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                y=chart_data[ticker].values,
-                x=chart_data[ticker].index,
-                mode="lines+markers",
-                name=ticker
-            ))
-            fig.update_layout(height=300, margin=dict(l=20, r=20, t=30, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("📈 Charts")
+    for ticker in df_results["Ticker"]:
+        df_chart = charts[ticker]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Close'], mode='lines+markers', name='Close'))
+        fig.update_layout(title=f"{ticker} - Last {x_days} Days", xaxis_title="Date", yaxis_title="Close Price")
+        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.warning("⚠️ No stocks found matching all criteria.")
